@@ -1,0 +1,1 @@
+"""Initialisation / démarrage du système."""

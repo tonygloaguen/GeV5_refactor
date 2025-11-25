@@ -1,0 +1,9 @@
+flask
+requests
+numpy
+matplotlib
+pyserial
+websocket-client
+waitress
+Werkzeug
+RPi.GPIO
