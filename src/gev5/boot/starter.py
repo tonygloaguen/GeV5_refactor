@@ -16,7 +16,6 @@ from ..core.alarmes import start_alarmes
 from __future__ import annotations
 
 import subprocess
-import threading
 from typing import List
 
 from ..utils.config import SystemConfig
@@ -329,7 +328,6 @@ class Gev5System:
         else:
             fermer_ports([9000, 6789])
 
-        # SMS
         if cfg.mod_SMS == 1:
             demarrage_serveur_SMS(cfg)
 
