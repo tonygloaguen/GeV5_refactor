@@ -3,61 +3,106 @@
 Système de contrôle et d’analyse radiologique – Version refactorisée
 
 Ce dépôt contient la nouvelle architecture logicielle complète du système GEV5.
-Il s’agit d’un refactor profond visant à :
-
-structurer proprement un ancien code monolithique (GeV5_Moteur.py)
-
 isoler les responsabilités métier (comptage, alarmes, défauts, courbes, etc.)
-
-créer un moteur modulaire, maintenable, testable
-
-préparer une fusion progressive des 12 modules dupliqués (par voie)
-
 isoler hardware / web / config
-
 supprimer la dépendance au script legacy
 
-📁 Architecture du projet
-GEV5/
-├── run.py                      # Point d'entrée principal
-├── requirements.txt            # Dépendances Python
-├── README.md                   # Ce document
-├── .gitignore
-│
-├── src/
-│   └── gev5/
-│       ├── main.py             # Démarrage officiel du moteur
-│       │
-│       ├── boot/
-│       │   ├── loader.py       # Charge Parametres.db → SystemConfig
-│       │   └── starter.py      # Orchestrateur du système
-│       │
-│       ├── core/               # Nouvelle logique métier propre
-│       │   ├── comptage/
-│       │   │   └── __init__.py (start_comptage)
-│       │   ├── alarmes/
-│       │   │   └── __init__.py (start_alarmes)
-│       │   ├── defauts/
-│       │   │   └── __init__.py (start_defauts)
-│       │   └── courbes/
-│       │       └── __init__.py (start_courbes)
-│       │
-│       ├── hardware/           # (à venir) Unipi, EVOK, capteurs, comms
-│       ├── web/                # (à venir) Flask & API REST
-│       ├── utils/
-│       │   ├── config.py       # SystemConfig
-│       │   └── logging.py      # Logger unifié
-│       │
-│       └── legacy/             # Code historique pré-refactor
-│           ├── comptage_1.py … comptage_12.py
-│           ├── alarme_1.py … alarme_12.py
-│           ├── defaut_1.py … defaut_12.py
-│           ├── courbe_1.py … courbe_12.py
-│           └── GeV5_Moteur.py  # Conservé en référence
-│
-├── templates/                  # HTML – Interface Web (Flask)
-├── static/                     # CSS / JS / images / sons / modèles YOLO
-├── images/
+Il s’agit d’un refactor profond visant à :
+- Structurer proprement l’ancien code monolithique (GeV5_Moteur.py)
+- Isoler les responsabilités métier (comptage, alarmes, défauts, courbes, etc.)
+- Créer un moteur modulaire, maintenable, testable
+- Fusionner progressivement les 12 modules dupliqués (par voie)
+- Isoler hardware / web / config
+- Supprimer toute dépendance au code legacy
+
+
+📦 gev5
+├── boot
+│   ├── loader.py
+│   ├── starter.py
+│   └── __init__.py
+├── core
+│   ├── acquittement
+│   │   ├── acquittement.py
+│   │   └── __init__.py
+│   ├── alarmes
+│   │   ├── alarme_1.py ... alarme_12.py
+│   │   └── __init__.py
+│   ├── comptage
+│   │   ├── comptage_1.py ... comptage_12.py
+│   │   └── __init__.py
+│   ├── courbes
+│   │   ├── courbe_1.py ... courbe_12.py
+│   │   └── __init__.py
+│   ├── defauts
+│   │   ├── defaut_1.py ... defaut_12.py
+│   │   └── __init__.py
+│   ├── simulation
+│   │   ├── simulateur.py
+│   │   └── __init__.py
+│   ├── vitesse
+│   │   └── __init__.py
+│   └── __init__.py
+├── hardware
+│   ├── modem
+│   │   ├── Modem_SMS
+│   │   │   └── switch_to_modem.sh
+│   │   ├── envoi_sms.py
+│   │   ├── test_SMS.py
+│   │   └── test_SMS_2.py
+│   ├── storage
+│   │   ├── collect_bdf.py
+│   │   ├── db_patch.py
+│   │   ├── DB_write.py
+│   │   ├── email.py
+│   │   ├── Envoi_email.py
+│   │   ├── rapport_pdf.py
+│   │   ├── reinit_credent.py
+│   │   └── reinit_params.py
+│   ├── system
+│   │   └── Thread_Watchdog.py
+│   ├── Check_open_cell.py
+│   ├── Chkdisk.py
+│   ├── Driver_F2C.py
+│   ├── etat_cellule_1.py
+│   ├── etat_cellule_2.py
+│   ├── evx_f2c.py
+│   ├── eVx_interface.py
+│   ├── interface.py
+│   ├── io_broker.py
+│   ├── modbus_interface.py
+│   ├── network_config.py
+│   ├── prise_photo.py
+│   ├── relais.py
+│   ├── Svr_Unipi.py
+│   ├── test_ANPR.py
+│   ├── test_camera.py
+│   ├── USB_control.py
+│   ├── vitesse_chargement.py
+│   └── __init__.py
+├── tests
+│   ├── alarm_bus.py
+│   ├── auto_tester.py
+│   ├── email_tester.py
+│   ├── test.py
+│   ├── test_in.py
+│   └── test_ws.py
+├── tools
+│   ├── any_dsk_srv.py
+│   ├── patch_alarme_all.py
+│   └── sitecustomize.py
+├── utils
+│   ├── config.py
+│   ├── logging.py
+│   └── __init__.py
+├── web
+│   ├── routes
+│   │   └── api.py
+│   ├── app.py
+│   ├── legacy_api.py
+│   └── __init__.py
+├── main.py
+└── __init__.py
 ├── temp/
 └── tests/                      # Tests unitaires
 
@@ -160,18 +205,15 @@ Pour pouvoir tester, simuler, et porter le système n’importe où.
 ✔ Comptage déplacé → core/comptage/start_comptage
 ✔ Alarmes déplacées → core/alarmes/start_alarmes
 
-🚧 À venir
-1. Regrouper le hardware
+✔ Réalisé
+1. Hardware regroupé
 
-Unipi, EVOK, Modbus, eVx, F2C, USB, disque, caméra, ANPR…
+Tous les modules matériels (Unipi, EVOK, Modbus, eVx, F2C, USB, disque, caméra, ANPR…) sont désormais organisés dans le dossier `hardware/`.
 
-2. Extraire et structurer Flask
+2. Flask extrait et structuré
 
-/web/app.py
-
-/web/routes/*
-
-gestion des traductions (static/lang)
+L’application web est structurée dans `/web/app.py` et les routes dans `/web/routes/`.
+La gestion des traductions est assurée via `static/lang`.
 
 3. Fusionner les 12 modules par famille
 

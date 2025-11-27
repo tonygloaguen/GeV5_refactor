@@ -1,371 +1,470 @@
-# src/gev5/boot/starter.py
 """
-Démarrage coordonné de tous les services GeV5.
-
-Ce module reprend la logique de démarrage de legacy/GeV5_Moteur.py,
-mais en l'adossant à SystemConfig plutôt qu'à des variables globales.
+Starter GeV5 - Orchestration principale
+Démarre tous les services du portique.
+Reprise de la logique GeV5_Moteur.py avec la nouvelle structure en packages.
 """
-from ..core.defauts import start_defauts
-
-from ..core.courbes import start_courbes
-
-from ..core.comptage import start_comptage
-
-from ..core.alarmes import start_alarmes
 
 from __future__ import annotations
 
 import subprocess
-from typing import List
+import threading
+from logging import Logger
+from typing import List, Optional
 
-from ..utils.config import SystemConfig
-from ..utils.logging import get_logger
+# ── Configuration et logging ──────────────────────────────────────────────────
+from src.gev5.utils.config import SystemConfig
+from src.gev5.utils.logging import get_logger
 
-# ── Imports legacy (code historique) ──────────────────────────────────────────
-from ..legacy import (
-    etat_cellule_1, etat_cellule_2, vitesse_chargement,
-    prise_photo,
-    alarme_1, alarme_2, alarme_3, alarme_4, alarme_5, alarme_6,
-    alarme_7, alarme_8, alarme_9, alarme_10, alarme_11, alarme_12,
-    acquittement, simulateur,
-    DB_write, rapport_pdf, Envoi_email,
-    modbus_interface,
-    eVx_interface,
-    Driver_F2C,
-    envoi_sms,
-    api_flsk,
-    collect_bdf,
-    Chkdisk,
-    USB_control,
-    Check_open_cell,
-    relais,
-    Svr_Unipi,
-    Thread_Watchdog,
-)
+logger: Logger = get_logger("gev5.starter")
+__all__ = ["Gev5System", "start_all"]
 
-logger = get_logger("gev5.starter")
+# ── HARDWARE ──────────────────────────────────────────────────────────────────
+# Interfaces réseau/bus
+try:
+    from src.gev5.hardware.Svr_Unipi import Srv_Unipi
+except ImportError:
+    Srv_Unipi = None
+    
+try:
+    from src.gev5.hardware.modbus_interface import Modbus_Interface
+except ImportError:
+    Modbus_Interface = None
+    
+try:
+    from src.gev5.hardware.eVx_interface import EVx_Interface
+except ImportError:
+    EVx_Interface = None
+    
+try:
+    from src.gev5.hardware.Driver_F2C import Driver_F2C
+except ImportError:
+    Driver_F2C = None
+
+# Périphériques
+try:
+    from src.gev5.hardware.USB_control import USB_Control
+except ImportError:
+    USB_Control = None
+    
+try:
+    from src.gev5.hardware.Chkdisk import ChkDisk
+except ImportError:
+    ChkDisk = None
+    
+try:
+    from src.gev5.hardware.prise_photo import PrisePhoto
+except ImportError:
+    PrisePhoto = None
+    
+try:
+    from src.gev5.hardware.relais import RelaisManager
+except ImportError:
+    RelaisManager = None
+
+# Storage
+try:
+    from src.gev5.hardware.storage.DB_write import DB_Write
+except ImportError:
+    DB_Write = None
+    
+try:
+    from src.gev5.hardware.storage.collect_bdf import CollectBDF
+except ImportError:
+    CollectBDF = None
+    
+try:
+    from src.gev5.hardware.storage.rapport_pdf import ReportPDF
+except ImportError:
+    ReportPDF = None
+    
+try:
+    from src.gev5.hardware.storage.email import EmailSender
+except ImportError:
+    EmailSender = None
+
+# SMS
+try:
+    from src.gev5.hardware.modem.envoi_sms import EnvoiSMS
+except ImportError:
+    EnvoiSMS = None
+
+# Cellules
+try:
+    from src.gev5.hardware.etat_cellule_1 import EtatCellule1
+except ImportError:
+    EtatCellule1 = None
+    
+try:
+    from src.gev5.hardware.etat_cellule_2 import EtatCellule2
+except ImportError:
+    EtatCellule2 = None
+    
+try:
+    from src.gev5.hardware.vitesse_chargement import VitesseChargement
+except ImportError:
+    VitesseChargement = None
+
+# Watchdog
+try:
+    from src.gev5.hardware.system.Thread_Watchdog import WatchdogThread
+except ImportError:
+    WatchdogThread = None
+
+# ── CORE MÉTIER (alarmes, comptage, etc.) ─────────────────────────────────────
+# TODO: importer les modules métier quand ils seront disponibles
+# from src.gev5.core.alarmes import ...
+# from src.gev5.core.comptage import ...
+# from src.gev5.core.defauts import ...
+# from src.gev5.core.courbes import ...
 
 
-# ── Utilitaires réseau (copie de GeV5_Moteur) ────────────────────────────────
+# ── API ──────────────────────────────────────────────────────────────
+try:
+    from src.gev5.web.app import run_flask_app
+except ImportError:
+    run_flask_app = None
 
+# ── Simulation ───────────────────────────────────────────────────────
+try:
+    from src.gev5.core.simulation.simulateur import Application as SimulationApp
+except ImportError:
+    SimulationApp = None
+
+# ── Acquittement ─────────────────────────────────────────────────────
+try:
+    from src.gev5.core.acquittement.acquittement import InputWatcher
+except ImportError:
+    InputWatcher = None
+
+
+# ─────────────────────────────────────────────────────
+# UTILITAIRES UFW (gestion firewall)
+# ─────────────────────────────────────────────────────
 def ouvrir_ports(ports: List[int], proto: str = "tcp") -> None:
+    """Ouvre les ports spécifiés via UFW."""
     for port in ports:
-        logger.info("Ouverture du port %s/%s via ufw", port, proto)
-        subprocess.run(["sudo", "ufw", "allow", f"{port}/{proto}"])
+        try:
+            subprocess.run(["sudo", "ufw", "allow", f"{port}/{proto}"], check=False)
+            logger.debug("Port %d/%s ouvert", port, proto)
+        except Exception as e:
+            logger.warning("Impossible d'ouvrir le port %d/%s: %s", port, proto, e)
 
 
 def fermer_ports(ports: List[int], proto: str = "tcp") -> None:
+    """Ferme les ports spécifiés via UFW."""
     for port in ports:
-        logger.info("Fermeture du port %s/%s via ufw", port, proto)
-        subprocess.run(["sudo", "ufw", "deny", f"{port}/{proto}"])
+        try:
+            subprocess.run(["sudo", "ufw", "deny", f"{port}/{proto}"], check=False)
+            logger.debug("Port %d/%s fermé", port, proto)
+        except Exception as e:
+            logger.warning("Impossible de fermer le port %d/%s: %s", port, proto, e)
 
 
-def is_ip_reachable(ip: str) -> bool:
-    """
-    Vérifie si une adresse IP est joignable (ping -c 1, comme sur le Pi).
-    """
-    try:
-        output = subprocess.run(
-            ["ping", "-c", "1", ip],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return output.returncode == 0
-    except Exception as e:
-        logger.error("Erreur lors de la vérification IP %s : %s", ip, e)
-        return False
 
 
-# ── Fonctions de démarrage "pures" (utilisent SystemConfig) ──────────────────
-
-def demarrage_serveur_SMS(cfg: SystemConfig) -> None:
-    logger.info("Démarrage service SMS (Hi-Link)")
-    sms_thread = envoi_sms.SMSModule(cfg.nom_portique, phone_numbers=cfg.SMS)
-    sms_thread.setName("SMS_Module_Thread")
-    sms_thread.start()
-
-
-def demarrage_compteurs(cfg: SystemConfig) -> None:
-    start_comptage(cfg)
-    logger.info("Démarrage des modules de comptage")
-
-
-def demarrage_cellules(cfg: SystemConfig) -> None:
-    logger.info("Démarrage des modules de contrôle des cellules")
-
-    input1_watcher = etat_cellule_1.InputWatcher(cfg.mode_sans_cellules, cfg.sim)
-    input1_watcher.setName("Etat_Cellule_1_Watcher")
-    input1_watcher.start()
-
-    input2_watcher = etat_cellule_2.InputWatcher(cfg.mode_sans_cellules, cfg.sim)
-    input2_watcher.setName("Etat_Cellule_2_Watcher")
-    input2_watcher.start()
-
-    list_watcher = vitesse_chargement.ListWatcher(
-        cfg.distance_cellules, cfg.mode_sans_cellules
-    )
-    list_watcher.setName("Vitesse_Chargement_Watcher")
-    list_watcher.start()
-
-
-def demarrage_fonctions_camera(cfg: SystemConfig) -> None:
-    logger.info("Démarrage prise de photo et ANPR")
-    prise_plaque = prise_photo.PrisePhoto(cfg.RTSP, cfg.mode_sans_cellules)
-    prise_plaque.setName("Prise_Plaque_Thread")
-    prise_plaque.start()
-
-
-def demarrage_alarmes(cfg: SystemConfig) -> None:
-    start_alarmes(cfg)
-    logger.info("Démarrage des modules d'alarmes")
-
-
-def demarrage_acq(cfg: SystemConfig) -> None:
-    logger.info("Démarrage du contrôle acquittement")
-    t = acquittement.InputWatcher(cfg.sim)
-    t.setName("Acquittement_InputWatcher")
-    t.start()
-
-
-def demarrage_stock_base(cfg: SystemConfig) -> None:
-    logger.info("Démarrage du module d'écriture BDD")
-    t = DB_write.DataRecorder()
-    t.setName("DB_Write_Thread")
-    t.start()
-
-
-def demarrage_defaut(cfg: SystemConfig) -> None:
-    start_defauts(cfg)
-    logger.info("Démarrage des modules de défauts")
-
-
-def demarrage_courbe(cfg: SystemConfig) -> None:
-    start_courbes(cfg)
-    logger.info("Démarrage des modules de courbes")
-
-
-def demarrage_relais(cfg: SystemConfig) -> None:
-    logger.info("Démarrage du module relais")
-    t = relais.Relais()
-    t.setName("Relais_Thread")
-    t.start()
-
-
-def demarrage_report_pdf(cfg: SystemConfig) -> None:
-    logger.info("Démarrage moteur génération PDF")
-
-    noms_detecteurs = [
-        cfg.D1_nom, cfg.D2_nom, cfg.D3_nom, cfg.D4_nom,
-        cfg.D5_nom, cfg.D6_nom, cfg.D7_nom, cfg.D8_nom,
-        cfg.D9_nom, cfg.D10_nom, cfg.D11_nom, cfg.D12_nom,
-    ]
-    t = rapport_pdf.ReportThread(
-        cfg.nom_portique,
-        cfg.mode_sans_cellules,
-        noms_detecteurs,
-        cfg.seuil2,
-        cfg.language,
-    )
-    t.setName("Rapport_PDF_Thread")
-    t.start()
-
-
-def demarrage_serveur_email(cfg: SystemConfig) -> None:
-    logger.info("Démarrage serveur mail")
-    email_sender = Envoi_email.EmailSender(
-        cfg.nom_portique,
-        cfg.smtp_server,
-        cfg.port,
-        cfg.login,
-        cfg.password,
-        cfg.sender,
-        cfg.recipients,
-    )
-    email_sender.setName("Email_Sender_Thread")
-    email_sender.start()
-
-
-def demarrage_int_modbus(cfg: SystemConfig) -> None:
-    logger.info("Démarrage communication ModBus")
-    t = modbus_interface.ModbusThread(cfg.echeance)
-    t.setName("Modbus_Thread")
-    t.start()
-
-
-def demarrage_eVx_interface(cfg: SystemConfig) -> None:
-    logger.info("Démarrage communication protocole eVx")
-    t = eVx_interface.eVx_Start()
-    t.setName("eVx_Interface_Thread")
-    t.start()
-
-
-def demarrage_F2C_Driver(cfg: SystemConfig) -> None:
-    logger.info("Démarrage communication protocole F2C")
-    t = Driver_F2C.F2CThread()
-    t.setName("F2C_Driver_Thread")
-    t.start()
-
-
-def demarrage_API_Web(cfg: SystemConfig) -> None:
-    logger.info("Démarrage Serveur WSGI (Flask)")
-    args = (
-        cfg.D1_nom, cfg.D2_nom, cfg.D3_nom, cfg.D4_nom,
-        cfg.D5_nom, cfg.D6_nom, cfg.D7_nom, cfg.D8_nom,
-        cfg.D9_nom, cfg.D10_nom, cfg.D11_nom, cfg.D12_nom,
-        cfg.nom_portique,
-        cfg.mode_sans_cellules,
-        cfg.echeance,
-    )
-    flask_thread = threading.Thread(
-        target=api_flsk.run_flask_app,
-        args=args,
-        name="Flask_API_Thread",
-        daemon=True,
-    )
-    flask_thread.start()
-
-
-def demarrage_stockage_bdf(cfg: SystemConfig) -> None:
-    logger.info("Démarrage collection de BDF")
-    t = collect_bdf.DataCollector()
-    t.setName("Collect_BDF_Thread")
-    t.start()
-
-
-def demarrage_control_diskspc(cfg: SystemConfig) -> None:
-    logger.info("Démarrage nettoyage disque")
-    directories_to_clean = [
-        "/home/pi/Partage/rapports",
-        "/home/pi/Partage/photo",
-    ]
-    monitor = Chkdisk.DiskSpaceMonitor(dirs_to_clean=directories_to_clean)
-    monitor.setName("Chkdisk_Thread")
-    monitor.start()
-
-
-def demarrage_control_cle_USB(cfg: SystemConfig) -> None:
-    logger.info("Démarrage contrôle clé USB")
-    t = threading.Thread(
-        target=USB_control.run_headless,
-        name="USB_Control_Thread",
-        daemon=True,
-    )
-    t.start()
-
-
-def control_open_cell(cfg: SystemConfig) -> None:
-    logger.info("Démarrage contrôle ouverture cellules")
-    chk_cell = Check_open_cell.etat_cellule_check(cfg.mode_sans_cellules)
-    chk_cell.setName("Check_Open_Cell_Thread")
-    chk_cell.start()
-
-
-def demarrage_Srv_Unipi(cfg: SystemConfig) -> None:
-    logger.info("Démarrage Serveur Unipi")
-    t = Svr_Unipi.Svr_Unipi_rec()
-    t.setName("Srv_Unipi_Thread")
-    t.start()
-
-
-def Watchdog(cfg: SystemConfig) -> None:
-    logger.info("Démarrage Watchdog")
-    monitor_thread = threading.Thread(
-        target=Thread_Watchdog.monitor_threads,
-        name="MonitorThread",
-        daemon=True,
-    )
-    monitor_thread.start()
-
-
-# ── Classe de haut niveau : Gev5System ───────────────────────────────────────
-
+# ─────────────────────────────────────────────────────
+# CLASSE ORCHESTRATION PRINCIPALE
+# ─────────────────────────────────────────────────────
 class Gev5System:
-    """
-    Orchestrateur de démarrage GeV5 à partir d'un SystemConfig.
-    """
-
+    """Orchestration de démarrage de tous les services GeV5."""
+    
     def __init__(self, cfg: SystemConfig) -> None:
-        self.cfg = cfg
-        self._sim_app = None
+        self.cfg: SystemConfig = cfg
+        self.sim_app: Optional[object] = None
+        self.threads: List[threading.Thread] = []
 
+    # ──────────────────────────────────────────────────
+    # DÉMARRAGE DES SERVICES INDIVIDUELS
+    # ──────────────────────────────────────────────────
+    
+    def _start_thread(self, thread_class, *args, thread_name: str, **kwargs) -> None:
+        """Helper pour démarrer un thread de manière cohérente."""
+        if thread_class is None:
+            logger.warning("Classe %s non disponible (import échoué)", thread_name)
+            return
+        
+        try:
+            t = thread_class(*args, **kwargs)
+            t.setName(thread_name)
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread %s démarré", thread_name)
+        except Exception as e:
+            logger.error("Erreur au démarrage de %s: %s", thread_name, e)
+
+    def start_unipi(self) -> None:
+        """Démarre le serveur UniPi."""
+        self._start_thread(Srv_Unipi, thread_name="Srv_Unipi")
+
+    def start_modbus(self) -> None:
+        """Démarre l'interface Modbus."""
+        ouvrir_ports([502, 5200])
+        self._start_thread(Modbus_Interface, thread_name="Modbus_Interface")
+
+    def start_evx(self) -> None:
+        """Démarre l'interface eVx."""
+        ouvrir_ports([9000, 6789])
+        self._start_thread(EVx_Interface, thread_name="EVx_Interface")
+
+    def start_f2c(self) -> None:
+        """Démarre le driver F2C."""
+        self._start_thread(Driver_F2C, thread_name="Driver_F2C")
+
+    def start_relais(self) -> None:
+        """Démarre le gestionnaire de relais."""
+        self._start_thread(RelaisManager, thread_name="Relais_Manager")
+
+    def start_usb(self) -> None:
+        """Démarre le contrôle USB."""
+        self._start_thread(USB_Control, thread_name="USB_Control")
+
+    def start_disk(self) -> None:
+        """Démarre la vérification disque."""
+        self._start_thread(ChkDisk, thread_name="ChkDisk")
+
+    def start_camera(self) -> None:
+        """Démarre la capture d'images."""
+        if PrisePhoto is None:
+            logger.warning("PrisePhoto non disponible")
+            return
+        
+        try:
+            t = PrisePhoto(self.cfg.RTSP, self.cfg.mode_sans_cellules)
+            t.setName("Camera_PrisePhoto")
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread Camera_PrisePhoto démarré")
+        except Exception as e:
+            logger.error("Erreur au démarrage de Camera_PrisePhoto: %s", e)
+
+    def start_acquittement(self) -> None:
+        """Démarre le module d'acquittement."""
+        if InputWatcher is None:
+            logger.warning("InputWatcher non disponible")
+            return
+        
+        try:
+            t = InputWatcher(self.cfg.sim)
+            t.setName("Acquittement")
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread Acquittement démarré")
+        except Exception as e:
+            logger.error("Erreur au démarrage d'Acquittement: %s", e)
+
+    def start_bdf(self) -> None:
+        """Démarre la collection des base de données.fichiers."""
+        self._start_thread(CollectBDF, thread_name="CollectBDF")
+
+    def start_db_write(self) -> None:
+        """Démarre l'enregistrement en base de données."""
+        self._start_thread(DB_Write, thread_name="DB_Write")
+
+    def start_report(self) -> None:
+        """Démarre la génération de rapports PDF."""
+        if ReportPDF is None:
+            logger.warning("ReportPDF non disponible")
+            return
+        
+        try:
+            noms_detecteurs = [
+                self.cfg.D1_nom, self.cfg.D2_nom, self.cfg.D3_nom,
+                self.cfg.D4_nom, self.cfg.D5_nom, self.cfg.D6_nom,
+                self.cfg.D7_nom, self.cfg.D8_nom, self.cfg.D9_nom,
+                self.cfg.D10_nom, self.cfg.D11_nom, self.cfg.D12_nom,
+            ]
+            t = ReportPDF(
+                self.cfg.nom_portique,
+                self.cfg.mode_sans_cellules,
+                noms_detecteurs,
+                self.cfg.seuil2,
+                self.cfg.language
+            )
+            t.setName("ReportPDF")
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread ReportPDF démarré")
+        except Exception as e:
+            logger.error("Erreur au démarrage de ReportPDF: %s", e)
+
+    def start_email(self) -> None:
+        """Démarre le module d'envoi d'emails."""
+        if EmailSender is None:
+            logger.warning("EmailSender non disponible")
+            return
+        
+        try:
+            t = EmailSender(
+                self.cfg.nom_portique,
+                self.cfg.smtp_server,
+                self.cfg.port,
+                self.cfg.login,
+                self.cfg.password,
+                self.cfg.sender,
+                self.cfg.recipients,
+            )
+            t.setName("EmailSender")
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread EmailSender démarré")
+        except Exception as e:
+            logger.error("Erreur au démarrage d'EmailSender: %s", e)
+
+    def start_sms(self) -> None:
+        """Démarre le module SMS."""
+        if EnvoiSMS is None:
+            logger.warning("EnvoiSMS non disponible")
+            return
+        
+        try:
+            t = EnvoiSMS(self.cfg.nom_portique, self.cfg.SMS)
+            t.setName("SMS_Module")
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread SMS_Module démarré")
+        except Exception as e:
+            logger.error("Erreur au démarrage du SMS: %s", e)
+
+    def start_cellules(self) -> None:
+        """Démarre les modules de cellules."""
+        cellules = []
+        
+        if EtatCellule1:
+            try:
+                c1 = EtatCellule1(self.cfg.sim)
+                c1.setName("EtatCellule1")
+                cellules.append(c1)
+            except Exception as e:
+                logger.error("Erreur création EtatCellule1: %s", e)
+        
+        if EtatCellule2:
+            try:
+                c2 = EtatCellule2(self.cfg.sim)
+                c2.setName("EtatCellule2")
+                cellules.append(c2)
+            except Exception as e:
+                logger.error("Erreur création EtatCellule2: %s", e)
+        
+        if VitesseChargement:
+            try:
+                c3 = VitesseChargement(self.cfg.sim)
+                c3.setName("VitesseChargement")
+                cellules.append(c3)
+            except Exception as e:
+                logger.error("Erreur création VitesseChargement: %s", e)
+        
+        for t in cellules:
+            t.start()
+            self.threads.append(t)
+            logger.info("Thread %s démarré", t.name)
+
+    def start_watchdog(self) -> None:
+        """Démarre le watchdog système."""
+        self._start_thread(WatchdogThread, thread_name="Watchdog_Thread")
+
+    def start_api(self) -> None:
+        """Démarre l'API Flask."""
+        if run_flask_app is None:
+            logger.warning("API Flask non disponible")
+            return
+        
+        try:
+            noms_detecteurs = [
+                self.cfg.D1_nom, self.cfg.D2_nom, self.cfg.D3_nom,
+                self.cfg.D4_nom, self.cfg.D5_nom, self.cfg.D6_nom,
+                self.cfg.D7_nom, self.cfg.D8_nom, self.cfg.D9_nom,
+                self.cfg.D10_nom, self.cfg.D11_nom, self.cfg.D12_nom,
+            ]
+            thread = threading.Thread(
+                target=run_flask_app,
+                args=(
+                    *noms_detecteurs,
+                    self.cfg.nom_portique,
+                    self.cfg.mode_sans_cellules,
+                    self.cfg.echeance,
+                ),
+                daemon=True,
+                name="Flask_API"
+            )
+            thread.start()
+            self.threads.append(thread)
+            logger.info("Thread Flask_API démarré")
+        except Exception as e:
+            logger.error("Erreur au démarrage de l'API: %s", e)
+
+    # ──────────────────────────────────────────────────
+    # DÉMARRAGE GLOBAL ET ORCHESTRATION
+    # ──────────────────────────────────────────────────
+    
     def start_all(self) -> None:
-        cfg = self.cfg
-        logger.info("=== Démarrage GeV5 pour le portique %s ===", cfg.nom_portique)
+        """Lance tous les services du portique."""
+        cfg: SystemConfig = self.cfg
+        logger.info("╔════════════════════════════════════════════╗")
+        logger.info("║    Démarrage GeV5 - %s", cfg.nom_portique)
+        logger.info("╚════════════════════════════════════════════╝")
 
-        # Simulateur éventuel
+        # Démarrage du simulateur si mode simulation activé
         if cfg.sim == 1:
-            logger.info("Mode SIM = 1 : démarrage du simulateur Tkinter")
-            self._sim_app = simulateur.Application()
+            if SimulationApp:
+                try:
+                    self.sim_app = SimulationApp()
+                    logger.info("Mode simulation activé")
+                except Exception as e:
+                    logger.error("Erreur au démarrage du simulateur: %s", e)
+            else:
+                logger.warning("Simulateur non disponible")
 
-        # Démarrage des différents services (ordre inspiré de GeV5_Moteur.main)
-        demarrage_Srv_Unipi(cfg)
-        demarrage_compteurs(cfg)
-        demarrage_cellules(cfg)
+        # Services toujours actifs
+        self.start_unipi()
+        self.start_cellules()
+        self.start_relais()
+        self.start_camera()
+        self.start_acquittement()
+        self.start_db_write()
+        self.start_bdf()
+        self.start_report()
+        self.start_email()
+        self.start_api()
+        self.start_disk()
+        self.start_usb()
+        self.start_watchdog()
 
-        if cfg.camera == 1:
-            demarrage_fonctions_camera(cfg)
-
-        demarrage_alarmes(cfg)
-        demarrage_acq(cfg)
-        demarrage_defaut(cfg)
-        demarrage_courbe(cfg)
-        demarrage_stock_base(cfg)
-        demarrage_report_pdf(cfg)
-        demarrage_serveur_email(cfg)
-
-        # Modbus
+        # Services conditionnels - Modbus
         if cfg.modbus == 1:
-            ouvrir_ports([502, 5200])
-            demarrage_int_modbus(cfg)
+            logger.info("Modbus activé")
+            self.start_modbus()
         else:
             fermer_ports([502, 5200])
+            logger.info("Modbus désactivé")
 
-        # eVx / F2C
+        # Services conditionnels - eVx
         if cfg.eVx == 1:
-            ouvrir_ports([9000, 6789])
-            demarrage_eVx_interface(cfg)
-            demarrage_F2C_Driver(cfg)
+            logger.info("eVx activé")
+            self.start_evx()
+            self.start_f2c()
         else:
             fermer_ports([9000, 6789])
+            logger.info("eVx désactivé")
 
+        # Services conditionnels - SMS
         if cfg.mod_SMS == 1:
-            demarrage_serveur_SMS(cfg)
+            logger.info("SMS activé")
+            self.start_sms()
 
-        # API Web
-        demarrage_API_Web(cfg)
+        logger.info("╔════════════════════════════════════════════╗")
+        logger.info("║    Tous les threads sont lancés ✓         ║")
+        logger.info("╚════════════════════════════════════════════╝")
 
-        # Stockage BDF / maintenance
-        demarrage_stockage_bdf(cfg)
-        demarrage_control_diskspc(cfg)
-        control_open_cell(cfg)
-
-        # Check IPs des Hubs
-        if is_ip_reachable(cfg.Rem_IP):
-            logger.info("Le Hub %s est joignable.", cfg.Rem_IP)
-        else:
-            logger.warning("Le Hub %s n'est pas joignable.", cfg.Rem_IP)
-
-        if is_ip_reachable(cfg.Rem_IP_2):
-            logger.info("Le Hub %s est joignable.", cfg.Rem_IP_2)
-        else:
-            logger.warning("Le Hub %s n'est pas joignable.", cfg.Rem_IP_2)
-
-        # Relais, watchdog, clé USB
-        demarrage_relais(cfg)
-        Watchdog(cfg)
-        demarrage_control_cle_USB(cfg)
-
-        logger.info("Chargement du moteur GeV5 terminé.")
-
-        # Boucle Tk si simulateur
-        if cfg.sim == 1 and self._sim_app is not None:
-            logger.info("Entrée dans la boucle principale du simulateur Tkinter.")
-            self._sim_app.mainloop()
+        # Lance la boucle du simulateur si actif
+        if cfg.sim == 1 and self.sim_app:
+            try:
+                logger.info("Entrée en mode simulation (GUI)")
+                self.sim_app.mainloop()
+            except Exception as e:
+                logger.error("Erreur lors de mainloop simulateur: %s", e)
 
 
 def start_all(cfg: SystemConfig) -> None:
-    """
-    Fonction helper si tu ne veux pas instancier la classe à la main.
-    """
+    """Point d'entrée principal pour démarrer GeV5."""
     system = Gev5System(cfg)
     system.start_all()
