@@ -12,127 +12,119 @@ from logging import Logger
 from typing import List, Optional
 
 # ── Configuration et logging ──────────────────────────────────────────────────
-from src.gev5.utils.config import SystemConfig
-from src.gev5.utils.logging import get_logger
+from ..utils.config import SystemConfig
+from ..utils.logging import get_logger
 
 logger: Logger = get_logger("gev5.starter")
+
 __all__ = ["Gev5System", "start_all"]
 
 # ── HARDWARE ──────────────────────────────────────────────────────────────────
-# Interfaces réseau/bus
 try:
-    from src.gev5.hardware.Svr_Unipi import Srv_Unipi
+    from ..hardware.Svr_Unipi import Srv_Unipi
 except ImportError:
     Srv_Unipi = None
-    
+
 try:
-    from src.gev5.hardware.modbus_interface import Modbus_Interface
+    from ..hardware.modbus_interface import Modbus_Interface
 except ImportError:
     Modbus_Interface = None
-    
+
 try:
-    from src.gev5.hardware.eVx_interface import EVx_Interface
+    from ..hardware.eVx_interface import EVx_Interface
 except ImportError:
     EVx_Interface = None
-    
+
 try:
-    from src.gev5.hardware.Driver_F2C import Driver_F2C
+    from ..hardware.Driver_F2C import Driver_F2C
 except ImportError:
     Driver_F2C = None
 
 # Périphériques
 try:
-    from src.gev5.hardware.USB_control import USB_Control
+    from ..hardware.USB_control import USB_Control
 except ImportError:
     USB_Control = None
-    
+
 try:
-    from src.gev5.hardware.Chkdisk import ChkDisk
+    from ..hardware.Chkdisk import ChkDisk
 except ImportError:
     ChkDisk = None
-    
+
 try:
-    from src.gev5.hardware.prise_photo import PrisePhoto
+    from ..hardware.prise_photo import PrisePhoto
 except ImportError:
     PrisePhoto = None
-    
+
 try:
-    from src.gev5.hardware.relais import RelaisManager
+    from ..hardware.relais import RelaisManager
 except ImportError:
     RelaisManager = None
 
 # Storage
 try:
-    from src.gev5.hardware.storage.DB_write import DB_Write
+    from ..hardware.storage.DB_write import DB_Write
 except ImportError:
     DB_Write = None
-    
+
 try:
-    from src.gev5.hardware.storage.collect_bdf import CollectBDF
+    from ..hardware.storage.collect_bdf import CollectBDF
 except ImportError:
     CollectBDF = None
-    
+
 try:
-    from src.gev5.hardware.storage.rapport_pdf import ReportPDF
+    from ..hardware.storage.rapport_pdf import ReportPDF
 except ImportError:
     ReportPDF = None
-    
+
 try:
-    from src.gev5.hardware.storage.email import EmailSender
+    from ..hardware.storage.email import EmailSender
 except ImportError:
     EmailSender = None
 
 # SMS
 try:
-    from src.gev5.hardware.modem.envoi_sms import EnvoiSMS
+    from ..hardware.modem.envoi_sms import EnvoiSMS
 except ImportError:
     EnvoiSMS = None
 
 # Cellules
 try:
-    from src.gev5.hardware.etat_cellule_1 import EtatCellule1
+    from ..hardware.etat_cellule_1 import EtatCellule1
 except ImportError:
     EtatCellule1 = None
-    
+
 try:
-    from src.gev5.hardware.etat_cellule_2 import EtatCellule2
+    from ..hardware.etat_cellule_2 import EtatCellule2
 except ImportError:
     EtatCellule2 = None
-    
+
 try:
-    from src.gev5.hardware.vitesse_chargement import VitesseChargement
+    from ..hardware.vitesse_chargement import VitesseChargement
 except ImportError:
     VitesseChargement = None
 
 # Watchdog
 try:
-    from src.gev5.hardware.system.Thread_Watchdog import WatchdogThread
+    from ..hardware.system.Thread_Watchdog import WatchdogThread
 except ImportError:
     WatchdogThread = None
 
-# ── CORE MÉTIER (alarmes, comptage, etc.) ─────────────────────────────────────
-# TODO: importer les modules métier quand ils seront disponibles
-# from src.gev5.core.alarmes import ...
-# from src.gev5.core.comptage import ...
-# from src.gev5.core.defauts import ...
-# from src.gev5.core.courbes import ...
-
-
 # ── API ──────────────────────────────────────────────────────────────
 try:
-    from src.gev5.web.app import run_flask_app
+    from ..web.app import run_flask_app
 except ImportError:
     run_flask_app = None
 
 # ── Simulation ───────────────────────────────────────────────────────
 try:
-    from src.gev5.core.simulation.simulateur import Application as SimulationApp
+    from ..core.simulation.simulateur import Application as SimulationApp
 except ImportError:
     SimulationApp = None
 
 # ── Acquittement ─────────────────────────────────────────────────────
 try:
-    from src.gev5.core.acquittement.acquittement import InputWatcher
+    from ..core.acquittement.acquittement import InputWatcher
 except ImportError:
     InputWatcher = None
 
