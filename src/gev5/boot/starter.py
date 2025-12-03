@@ -22,11 +22,9 @@ Hypothèses basées sur la V1 :
 
 from __future__ import annotations
 
-
-
 import threading
 from logging import Logger
-from typing import Dict, List
+from typing import Dict, List, Callable
 
 from ..utils.config import SystemConfig
 from ..utils.logging import get_logger
@@ -39,12 +37,13 @@ from ..core.courbes.build import build_all_courbes
 
 from ..hardware.storage.collect_bdf_v2 import BdfCollectorV2
 from ..hardware.storage.db_write_v2 import PassageRecorderV2
+from ..hardware.storage.rapport_pdf import ReportThread
 
 logger: Logger = get_logger("gev5.starter")
 
 
 class Gev5System:
-    """Orchestrateur principal GeV5 (voies / alarmes / défauts / courbes)."""
+    """Orchestrateur principal GeV5 (voies / alarmes / défauts / courbes + stockage)."""
 
     def __init__(self, cfg: SystemConfig) -> None:
         self.cfg = cfg
@@ -56,9 +55,12 @@ class Gev5System:
         self.defaut_threads: List[threading.Thread] = []
         self.courbe_threads: List[threading.Thread] = []
 
+        # Stockage V2
         self.bdf_thread: threading.Thread | None = None
         self.passage_thread: threading.Thread | None = None
 
+        # Rapport PDF / email
+        self.report_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------ #
     # Helpers de mapping
@@ -99,7 +101,7 @@ class Gev5System:
             12: self.cfg.D12_ON,
         }
 
-    def _build_passage_flags(self) -> Dict[int, callable]:
+    def _build_passage_flags(self) -> Dict[int, Callable[[], bool]]:
         """
         Construit un dict {voie: callable_bool} indiquant si un passage
         est en cours.
@@ -122,13 +124,13 @@ class Gev5System:
             except Exception:
                 return False
 
-        flags: Dict[int, callable] = {}
+        flags: Dict[int, Callable[[], bool]] = {}
         for ch in range(1, 13):
             flags[ch] = passage_actif
         return flags
 
     # ------------------------------------------------------------------ #
-    # Démarrage des familles
+    # Démarrage des familles "cœur temps réel"
     # ------------------------------------------------------------------ #
     def start_comptage(self) -> None:
         """
@@ -274,17 +276,20 @@ class Gev5System:
             self.threads.append(t)
 
         logger.info("Courbes: %d threads démarrés", len(self.courbe_threads))
-    
-        def start_bdf_collector(self) -> None:
-            """
-            Démarre le collecteur V2 du bruit de fond.
 
-            Il lit AlarmeThread.fond[1..12] et écrit dans Bruit_de_fond.db.
-            """
-            self.bdf_thread = BdfCollectorV2(interval=60)
-            self.bdf_thread.start()
-            self.threads.append(self.bdf_thread)
-            logger.info("BdfCollectorV2 démarré (interval=60s).")
+    # ------------------------------------------------------------------ #
+    # Démarrage stockage V2 + rapport PDF
+    # ------------------------------------------------------------------ #
+    def start_bdf_collector(self) -> None:
+        """
+        Démarre le collecteur V2 du bruit de fond.
+
+        Il lit AlarmeThread.fond[1..12] et écrit dans Bruit_de_fond.db.
+        """
+        self.bdf_thread = BdfCollectorV2(interval=60)
+        self.bdf_thread.start()
+        self.threads.append(self.bdf_thread)
+        logger.info("BdfCollectorV2 démarré (interval=60s).")
 
     def start_passage_recorder(self) -> None:
         """
@@ -297,22 +302,54 @@ class Gev5System:
         self.threads.append(self.passage_thread)
         logger.info("PassageRecorderV2 démarré.")
 
+    def start_report_thread(self) -> None:
+        """
+        Démarre le thread de génération de rapports PDF (V2),
+        branché comme en V1 côté Envoi_email (email_send_rapport).
+        """
+        noms_detecteurs = {
+            1: self.cfg.D1_nom,
+            2: self.cfg.D2_nom,
+            3: self.cfg.D3_nom,
+            4: self.cfg.D4_nom,
+            5: self.cfg.D5_nom,
+            6: self.cfg.D6_nom,
+            7: self.cfg.D7_nom,
+            8: self.cfg.D8_nom,
+            9: self.cfg.D9_nom,
+            10: self.cfg.D10_nom,
+            11: self.cfg.D11_nom,
+            12: self.cfg.D12_nom,
+        }
+
+        self.report_thread = ReportThread(
+            Nom_portique=self.cfg.nom_portique,
+            Mode_sans_cellules=self.cfg.mode_sans_cellules,
+            noms_detecteurs=noms_detecteurs,
+            seuil2=self.cfg.seuil2,
+            language=self.cfg.language,
+        )
+        self.report_thread.start()
+        self.threads.append(self.report_thread)
+        logger.info("ReportThread (PDF V2) démarré.")
 
     # ------------------------------------------------------------------ #
     # Démarrage global
     # ------------------------------------------------------------------ #
-        def start_all(self) -> None:
-            logger.info("Démarrage GeV5 (cœur voies + stockage V2)")
+    def start_all(self) -> None:
+        logger.info("Démarrage GeV5 (cœur voies + stockage V2 + rapport PDF)")
 
-            # Cœur temps réel
-            self.start_comptage()
-            self.start_defauts()
-            self.start_alarmes()
-            self.start_courbes()
+        # Cœur temps réel
+        self.start_comptage()
+        self.start_defauts()
+        self.start_alarmes()
+        self.start_courbes()
 
-            # Stockage V2 (fond + passages)
-            self.start_bdf_collector()
-            self.start_passage_recorder()
+        # Stockage V2 (fond + passages)
+        self.start_bdf_collector()
+        self.start_passage_recorder()
 
-            logger.info("Tous les threads GeV5 (voies + stockage V2) sont démarrés.")
+        # Rapport PDF (comme avant, mais basé sur V2)
+        self.start_report_thread()
 
+        logger.info("Tous les threads GeV5 (voies + stockage V2 + rapport PDF) sont démarrés.")
