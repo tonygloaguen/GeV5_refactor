@@ -1,4 +1,4 @@
-# src/gev5/boot/loader.py
+# gev5/boot/loader.py
 """
 Chargement de la configuration système depuis la base Parametres.db.
 
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from ..utils.config import SystemConfig
+from ..utils.paths import PARAM_DB_PATH
 
 
 def _get_parametres(db_path: str) -> Dict[str, str]:
@@ -74,11 +75,14 @@ def load_config(db_path: Optional[str] = None) -> SystemConfig:
     """
     Charge la configuration système complète depuis Parametres.db
     et retourne un objet SystemConfig prêt à l'emploi.
+
+    - Si db_path est None → utilise le chemin centralisé dans utils.paths.PARAM_DB_PATH
+    - Si db_path est fourni → surcharge (utile pour les tests / outils).
     """
 
-    # Valeur par défaut Raspberry (comme dans GeV5_Moteur.py)
+    # Chemin par défaut basé sur le répertoire local `partage/Base_donnees`
     if db_path is None:
-        db_path = "/home/pi/Partage/Base_donnees/Parametres.db"
+        db_path = str(PARAM_DB_PATH)
 
     # On permet une surcharge en dev si chemin relatif
     db_path = str(Path(db_path))

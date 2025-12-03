@@ -1,462 +1,318 @@
 """
-Starter GeV5 - Orchestration principale
-Démarre tous les services du portique.
-Reprise de la logique GeV5_Moteur.py avec la nouvelle structure en packages.
+Starter GeV5 - Orchestration principale (version refactorisée et cohérente
+avec SystemConfig, le comptage, les alarmes, les défauts et les courbes).
+
+Hypothèses basées sur la V1 :
+
+- Défauts :
+    * seuil bas  défaut  = cfg.low
+    * seuil haut défaut  = cfg.high
+
+- Alarmes radiologiques :
+    * seuil N1 (alarme)  = cfg.seuil2
+    * seuil de retour    ≈ 0.8 * cfg.seuil2  (hystérésis simple)
+    * seuil N2 (alarme 2)= calculé dans AlarmeThread via n2_factor (par défaut 1.5)
+    * seuil suiveur      = fond * cfg.multiple
+
+- Voies :
+    * voies 1..4  : électroniques locales, comptage GPIO (PIN_1..PIN_4)
+    * voies 5..8  : électronique esclave 1 (Rem_IP)  → à intégrer plus tard
+    * voies 9..12 : électronique esclave 2 (Rem_IP_2)→ à intégrer plus tard
 """
 
 from __future__ import annotations
 
-import subprocess
+
+
 import threading
 from logging import Logger
-from typing import List, Optional
+from typing import Dict, List
 
-# ── Configuration et logging ──────────────────────────────────────────────────
 from ..utils.config import SystemConfig
 from ..utils.logging import get_logger
 
+from ..core.comptage.build import build_all_comptages
+from ..core.comptage.comptage import ComptageThread
+from ..core.alarmes.build import build_all_alarmes
+from ..core.defauts.build import build_all_defauts
+from ..core.courbes.build import build_all_courbes
+
+from ..hardware.storage.collect_bdf_v2 import BdfCollectorV2
+from ..hardware.storage.db_write_v2 import PassageRecorderV2
+
 logger: Logger = get_logger("gev5.starter")
 
-__all__ = ["Gev5System", "start_all"]
 
-# ── HARDWARE ──────────────────────────────────────────────────────────────────
-try:
-    from ..hardware.Svr_Unipi import Srv_Unipi
-except ImportError:
-    Srv_Unipi = None
-
-try:
-    from ..hardware.modbus_interface import Modbus_Interface
-except ImportError:
-    Modbus_Interface = None
-
-try:
-    from ..hardware.eVx_interface import EVx_Interface
-except ImportError:
-    EVx_Interface = None
-
-try:
-    from ..hardware.Driver_F2C import Driver_F2C
-except ImportError:
-    Driver_F2C = None
-
-# Périphériques
-try:
-    from ..hardware.USB_control import USB_Control
-except ImportError:
-    USB_Control = None
-
-try:
-    from ..hardware.Chkdisk import ChkDisk
-except ImportError:
-    ChkDisk = None
-
-try:
-    from ..hardware.prise_photo import PrisePhoto
-except ImportError:
-    PrisePhoto = None
-
-try:
-    from ..hardware.relais import RelaisManager
-except ImportError:
-    RelaisManager = None
-
-# Storage
-try:
-    from ..hardware.storage.DB_write import DB_Write
-except ImportError:
-    DB_Write = None
-
-try:
-    from ..hardware.storage.collect_bdf import CollectBDF
-except ImportError:
-    CollectBDF = None
-
-try:
-    from ..hardware.storage.rapport_pdf import ReportPDF
-except ImportError:
-    ReportPDF = None
-
-try:
-    from ..hardware.storage.email import EmailSender
-except ImportError:
-    EmailSender = None
-
-# SMS
-try:
-    from ..hardware.modem.envoi_sms import EnvoiSMS
-except ImportError:
-    EnvoiSMS = None
-
-# Cellules
-try:
-    from ..hardware.etat_cellule_1 import EtatCellule1
-except ImportError:
-    EtatCellule1 = None
-
-try:
-    from ..hardware.etat_cellule_2 import EtatCellule2
-except ImportError:
-    EtatCellule2 = None
-
-try:
-    from ..hardware.vitesse_chargement import VitesseChargement
-except ImportError:
-    VitesseChargement = None
-
-# Watchdog
-try:
-    from ..hardware.system.Thread_Watchdog import WatchdogThread
-except ImportError:
-    WatchdogThread = None
-
-# ── API ──────────────────────────────────────────────────────────────
-try:
-    from ..web.app import run_flask_app
-except ImportError:
-    run_flask_app = None
-
-# ── Simulation ───────────────────────────────────────────────────────
-try:
-    from ..core.simulation.simulateur import Application as SimulationApp
-except ImportError:
-    SimulationApp = None
-
-# ── Acquittement ─────────────────────────────────────────────────────
-try:
-    from ..core.acquittement.acquittement import InputWatcher
-except ImportError:
-    InputWatcher = None
-
-
-# ─────────────────────────────────────────────────────
-# UTILITAIRES UFW (gestion firewall)
-# ─────────────────────────────────────────────────────
-def ouvrir_ports(ports: List[int], proto: str = "tcp") -> None:
-    """Ouvre les ports spécifiés via UFW."""
-    for port in ports:
-        try:
-            subprocess.run(["sudo", "ufw", "allow", f"{port}/{proto}"], check=False)
-            logger.debug("Port %d/%s ouvert", port, proto)
-        except Exception as e:
-            logger.warning("Impossible d'ouvrir le port %d/%s: %s", port, proto, e)
-
-
-def fermer_ports(ports: List[int], proto: str = "tcp") -> None:
-    """Ferme les ports spécifiés via UFW."""
-    for port in ports:
-        try:
-            subprocess.run(["sudo", "ufw", "deny", f"{port}/{proto}"], check=False)
-            logger.debug("Port %d/%s fermé", port, proto)
-        except Exception as e:
-            logger.warning("Impossible de fermer le port %d/%s: %s", port, proto, e)
-
-
-
-
-# ─────────────────────────────────────────────────────
-# CLASSE ORCHESTRATION PRINCIPALE
-# ─────────────────────────────────────────────────────
 class Gev5System:
-    """Orchestration de démarrage de tous les services GeV5."""
-    
+    """Orchestrateur principal GeV5 (voies / alarmes / défauts / courbes)."""
+
     def __init__(self, cfg: SystemConfig) -> None:
-        self.cfg: SystemConfig = cfg
-        self.sim_app: Optional[object] = None
+        self.cfg = cfg
         self.threads: List[threading.Thread] = []
 
-    # ──────────────────────────────────────────────────
-    # DÉMARRAGE DES SERVICES INDIVIDUELS
-    # ──────────────────────────────────────────────────
+        # Références vers les threads par famille
+        self.comptage_threads: List[ComptageThread] = []
+        self.alarme_threads: List[threading.Thread] = []
+        self.defaut_threads: List[threading.Thread] = []
+        self.courbe_threads: List[threading.Thread] = []
+
+        self.bdf_thread: threading.Thread | None = None
+        self.passage_thread: threading.Thread | None = None
+
+
+    # ------------------------------------------------------------------ #
+    # Helpers de mapping
+    # ------------------------------------------------------------------ #
+    def _build_pins(self) -> Dict[int, int]:
+        """
+        Mapping {voie: pin_GPIO}.
+
+        Voies locales (1..4) → PIN_1..PIN_4
+        Voies 5..12 → pour l'instant 0 (seront gérées via Rem_IP / eVx
+        par d'autres services ; ici on ne crée que le squelette).
+        """
+        pins: Dict[int, int] = {
+            1: self.cfg.pin_1,
+            2: self.cfg.pin_2,
+            3: self.cfg.pin_3,
+            4: self.cfg.pin_4,
+        }
+        # voies "remote" → placeholder (0)
+        for ch in range(5, 13):
+            pins[ch] = 0
+        return pins
+
+    def _build_d_on_flags(self) -> Dict[int, int]:
+        """Mapping {voie: Dn_ON} à partir de SystemConfig."""
+        return {
+            1: self.cfg.D1_ON,
+            2: self.cfg.D2_ON,
+            3: self.cfg.D3_ON,
+            4: self.cfg.D4_ON,
+            5: self.cfg.D5_ON,
+            6: self.cfg.D6_ON,
+            7: self.cfg.D7_ON,
+            8: self.cfg.D8_ON,
+            9: self.cfg.D9_ON,
+            10: self.cfg.D10_ON,
+            11: self.cfg.D11_ON,
+            12: self.cfg.D12_ON,
+        }
+
+    def _build_passage_flags(self) -> Dict[int, callable]:
+        """
+        Construit un dict {voie: callable_bool} indiquant si un passage
+        est en cours.
+
+        Implémentation basée sur les modules legacy etat_cellule_1 / etat_cellule_2 :
+
+        - InputWatcher.cellules[1] / [2] → 1 si faisceau coupé
+        - On considère qu'il y a passage si au moins une des deux cellules est à 1.
+
+        Même logique pour toutes les voies (les cellules pilotent le portique entier).
+        """
+        # Import local pour éviter les cycles
+        from ..hardware import etat_cellule_1, etat_cellule_2  # type: ignore
+
+        def passage_actif() -> bool:
+            try:
+                c1 = getattr(etat_cellule_1.InputWatcher, "cellules", {}).get(1, 0)
+                c2 = getattr(etat_cellule_2.InputWatcher, "cellules", {}).get(2, 0)
+                return (c1 == 1) or (c2 == 1)
+            except Exception:
+                return False
+
+        flags: Dict[int, callable] = {}
+        for ch in range(1, 13):
+            flags[ch] = passage_actif
+        return flags
+
+    # ------------------------------------------------------------------ #
+    # Démarrage des familles
+    # ------------------------------------------------------------------ #
+    def start_comptage(self) -> None:
+        """
+        Démarre les 12 threads de comptage.
+
+        - voies 1..4 : GPIO réels (PIN_1..PIN_4)
+        - voies 5..12: pour l’instant, pins=0 (intégration remote à venir)
+        """
+        pins = self._build_pins()
+        d_on = self._build_d_on_flags()
+
+        self.comptage_threads = build_all_comptages(
+            sampling=self.cfg.sample_time,  # même rôle que "sampling" V1
+            pins=pins,
+            d_on_flags=d_on,
+            sim=self.cfg.sim,
+        )
+
+        for t in self.comptage_threads:
+            t.start()
+            self.threads.append(t)
+
+        logger.info("Comptage: %d threads démarrés", len(self.comptage_threads))
+
+    def start_defauts(self) -> None:
+        """
+        Démarre les défauts génériques.
+
+        Mapping V1 → V2 :
+        - limite_inferieure (défaut bas)  = cfg.low
+        - limite_superieure (défaut haut) = cfg.high
+        - période de test ≈ 60 s (comme Defaut_1 V1)
+        """
+        d_on_flags = self._build_d_on_flags()
+
+        limites_inf = {i: float(self.cfg.low) for i in range(1, 13)}
+        limites_sup = {i: float(self.cfg.high) for i in range(1, 13)}
+
+        # brut = compteur[10,20,...,120] comme dans la V1
+        get_raw_vals = {
+            i: (lambda i=i: ComptageThread.compteur.get(i * 10, 0.0))
+            for i in range(1, 13)
+        }
+
+        # D_ON par voie
+        get_d_on = {
+            i: (lambda i=i: d_on_flags[i])
+            for i in range(1, 13)
+        }
+
+        self.defaut_threads = build_all_defauts(
+            limites_inf=limites_inf,
+            limites_sup=limites_sup,
+            get_raw_vals=get_raw_vals,
+            get_d_on_flags=get_d_on,
+            period_s=60.0,  # comme le time.sleep(60) des Defaut_X V1
+        )
+
+        for t in self.defaut_threads:
+            t.start()
+            self.threads.append(t)
+
+        logger.info("Défauts: %d threads démarrés", len(self.defaut_threads))
+
+    def start_alarmes(self) -> None:
+        """
+        Démarre les alarmes génériques.
+
+        V1 :
+        - seuil radiologique = seuil2
+        - multiple           = multiple (sert au suiveur)
+        - Mode_sans_cellules : 0 = alarme déclenchée seulement pendant passage
+
+        Pour cette V2 générique :
+        - seuil_haut (N1) = cfg.seuil2
+        - seuil_bas       = 0.8 * cfg.seuil2 (hystérésis simple)
+        - tempo_s         = 0 (instantané, on pourra faire évoluer)
+        - multiple        = cfg.multiple (seuil suiveur = fond * multiple)
+        - get_passage_flags basé sur etat_cellule_1 / 2 si mode_sans_cellules == 0
+        """
+        d_on_flags = self._build_d_on_flags()
+
+        seuil_n1 = float(self.cfg.seuil2)
+        seuils_haut = {i: seuil_n1 for i in range(1, 13)}
+        seuils_bas = {i: 0.8 * seuil_n1 for i in range(1, 13)}
+
+        # lecture du comptage filtré : compteur[1..12]
+        get_vals = {
+            i: (lambda i=i: ComptageThread.compteur.get(i, 0.0))
+            for i in range(1, 13)
+        }
+
+        # activation par voie : Dn_ON == 1
+        enabled_flags = {
+            i: (lambda i=i: d_on_flags[i] == 1)
+            for i in range(1, 13)
+        }
+
+        # Hooks passage (cellules) seulement si on n'est PAS en mode sans cellules
+        get_passage_flags = None
+        if int(self.cfg.mode_sans_cellules) == 0:
+            get_passage_flags = self._build_passage_flags()
+
+        self.alarme_threads = build_all_alarmes(
+            seuils_haut=seuils_haut,
+            seuils_bas=seuils_bas,
+            get_vals=get_vals,
+            enabled_flags=enabled_flags,
+            period_s=0.1,                    # même rythme que le comptage
+            hysteresis=0.0,                  # hystérésis déjà géré via seuil_bas
+            tempo_s=0.0,                     # instantané pour l'instant
+            multiple=float(self.cfg.multiple),
+            mode_sans_cellules=int(self.cfg.mode_sans_cellules),
+            get_passage_flags=get_passage_flags,
+        )
+
+        for t in self.alarme_threads:
+            t.start()
+            self.threads.append(t)
+
+        logger.info("Alarmes: %d threads démarrés", len(self.alarme_threads))
+
+    def start_courbes(self) -> None:
+        """
+        Démarre les courbes génériques.
+
+        On échantillonne 1 valeur / seconde par défaut,
+        avec une profondeur de 3600 points (~1h).
+        """
+        get_vals = {
+            i: (lambda i=i: ComptageThread.compteur.get(i, 0.0))
+            for i in range(1, 13)
+        }
+
+        self.courbe_threads = build_all_courbes(
+            get_vals=get_vals,
+            max_points=3600,
+            period_s=1.0,
+        )
+
+        for t in self.courbe_threads:
+            t.start()
+            self.threads.append(t)
+
+        logger.info("Courbes: %d threads démarrés", len(self.courbe_threads))
     
-    def _start_thread(self, thread_class, *args, thread_name: str, **kwargs) -> None:
-        """Helper pour démarrer un thread de manière cohérente."""
-        if thread_class is None:
-            logger.warning("Classe %s non disponible (import échoué)", thread_name)
-            return
-        
-        try:
-            t = thread_class(*args, **kwargs)
-            t.setName(thread_name)
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread %s démarré", thread_name)
-        except Exception as e:
-            logger.error("Erreur au démarrage de %s: %s", thread_name, e)
+        def start_bdf_collector(self) -> None:
+            """
+            Démarre le collecteur V2 du bruit de fond.
 
-    def start_unipi(self) -> None:
-        """Démarre le serveur UniPi."""
-        self._start_thread(Srv_Unipi, thread_name="Srv_Unipi")
+            Il lit AlarmeThread.fond[1..12] et écrit dans Bruit_de_fond.db.
+            """
+            self.bdf_thread = BdfCollectorV2(interval=60)
+            self.bdf_thread.start()
+            self.threads.append(self.bdf_thread)
+            logger.info("BdfCollectorV2 démarré (interval=60s).")
 
-    def start_modbus(self) -> None:
-        """Démarre l'interface Modbus."""
-        ouvrir_ports([502, 5200])
-        self._start_thread(Modbus_Interface, thread_name="Modbus_Interface")
+    def start_passage_recorder(self) -> None:
+        """
+        Démarre l'enregistreur V2 des passages.
 
-    def start_evx(self) -> None:
-        """Démarre l'interface eVx."""
-        ouvrir_ports([9000, 6789])
-        self._start_thread(EVx_Interface, thread_name="EVx_Interface")
-
-    def start_f2c(self) -> None:
-        """Démarre le driver F2C."""
-        self._start_thread(Driver_F2C, thread_name="Driver_F2C")
-
-    def start_relais(self) -> None:
-        """Démarre le gestionnaire de relais."""
-        self._start_thread(RelaisManager, thread_name="Relais_Manager")
-
-    def start_usb(self) -> None:
-        """Démarre le contrôle USB."""
-        self._start_thread(USB_Control, thread_name="USB_Control")
-
-    def start_disk(self) -> None:
-        """Démarre la vérification disque."""
-        self._start_thread(ChkDisk, thread_name="ChkDisk")
-
-    def start_camera(self) -> None:
-        """Démarre la capture d'images."""
-        if PrisePhoto is None:
-            logger.warning("PrisePhoto non disponible")
-            return
-        
-        try:
-            t = PrisePhoto(self.cfg.RTSP, self.cfg.mode_sans_cellules)
-            t.setName("Camera_PrisePhoto")
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread Camera_PrisePhoto démarré")
-        except Exception as e:
-            logger.error("Erreur au démarrage de Camera_PrisePhoto: %s", e)
-
-    def start_acquittement(self) -> None:
-        """Démarre le module d'acquittement."""
-        if InputWatcher is None:
-            logger.warning("InputWatcher non disponible")
-            return
-        
-        try:
-            t = InputWatcher(self.cfg.sim)
-            t.setName("Acquittement")
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread Acquittement démarré")
-        except Exception as e:
-            logger.error("Erreur au démarrage d'Acquittement: %s", e)
-
-    def start_bdf(self) -> None:
-        """Démarre la collection des base de données.fichiers."""
-        self._start_thread(CollectBDF, thread_name="CollectBDF")
-
-    def start_db_write(self) -> None:
-        """Démarre l'enregistrement en base de données."""
-        self._start_thread(DB_Write, thread_name="DB_Write")
-
-    def start_report(self) -> None:
-        """Démarre la génération de rapports PDF."""
-        if ReportPDF is None:
-            logger.warning("ReportPDF non disponible")
-            return
-        
-        try:
-            noms_detecteurs = [
-                self.cfg.D1_nom, self.cfg.D2_nom, self.cfg.D3_nom,
-                self.cfg.D4_nom, self.cfg.D5_nom, self.cfg.D6_nom,
-                self.cfg.D7_nom, self.cfg.D8_nom, self.cfg.D9_nom,
-                self.cfg.D10_nom, self.cfg.D11_nom, self.cfg.D12_nom,
-            ]
-            t = ReportPDF(
-                self.cfg.nom_portique,
-                self.cfg.mode_sans_cellules,
-                noms_detecteurs,
-                self.cfg.seuil2,
-                self.cfg.language
-            )
-            t.setName("ReportPDF")
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread ReportPDF démarré")
-        except Exception as e:
-            logger.error("Erreur au démarrage de ReportPDF: %s", e)
-
-    def start_email(self) -> None:
-        """Démarre le module d'envoi d'emails."""
-        if EmailSender is None:
-            logger.warning("EmailSender non disponible")
-            return
-        
-        try:
-            t = EmailSender(
-                self.cfg.nom_portique,
-                self.cfg.smtp_server,
-                self.cfg.port,
-                self.cfg.login,
-                self.cfg.password,
-                self.cfg.sender,
-                self.cfg.recipients,
-            )
-            t.setName("EmailSender")
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread EmailSender démarré")
-        except Exception as e:
-            logger.error("Erreur au démarrage d'EmailSender: %s", e)
-
-    def start_sms(self) -> None:
-        """Démarre le module SMS."""
-        if EnvoiSMS is None:
-            logger.warning("EnvoiSMS non disponible")
-            return
-        
-        try:
-            t = EnvoiSMS(self.cfg.nom_portique, self.cfg.SMS)
-            t.setName("SMS_Module")
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread SMS_Module démarré")
-        except Exception as e:
-            logger.error("Erreur au démarrage du SMS: %s", e)
-
-    def start_cellules(self) -> None:
-        """Démarre les modules de cellules."""
-        cellules = []
-        
-        if EtatCellule1:
-            try:
-                c1 = EtatCellule1(self.cfg.sim)
-                c1.setName("EtatCellule1")
-                cellules.append(c1)
-            except Exception as e:
-                logger.error("Erreur création EtatCellule1: %s", e)
-        
-        if EtatCellule2:
-            try:
-                c2 = EtatCellule2(self.cfg.sim)
-                c2.setName("EtatCellule2")
-                cellules.append(c2)
-            except Exception as e:
-                logger.error("Erreur création EtatCellule2: %s", e)
-        
-        if VitesseChargement:
-            try:
-                c3 = VitesseChargement(self.cfg.sim)
-                c3.setName("VitesseChargement")
-                cellules.append(c3)
-            except Exception as e:
-                logger.error("Erreur création VitesseChargement: %s", e)
-        
-        for t in cellules:
-            t.start()
-            self.threads.append(t)
-            logger.info("Thread %s démarré", t.name)
-
-    def start_watchdog(self) -> None:
-        """Démarre le watchdog système."""
-        self._start_thread(WatchdogThread, thread_name="Watchdog_Thread")
-
-    def start_api(self) -> None:
-        """Démarre l'API Flask."""
-        if run_flask_app is None:
-            logger.warning("API Flask non disponible")
-            return
-        
-        try:
-            noms_detecteurs = [
-                self.cfg.D1_nom, self.cfg.D2_nom, self.cfg.D3_nom,
-                self.cfg.D4_nom, self.cfg.D5_nom, self.cfg.D6_nom,
-                self.cfg.D7_nom, self.cfg.D8_nom, self.cfg.D9_nom,
-                self.cfg.D10_nom, self.cfg.D11_nom, self.cfg.D12_nom,
-            ]
-            thread = threading.Thread(
-                target=run_flask_app,
-                args=(
-                    *noms_detecteurs,
-                    self.cfg.nom_portique,
-                    self.cfg.mode_sans_cellules,
-                    self.cfg.echeance,
-                ),
-                daemon=True,
-                name="Flask_API"
-            )
-            thread.start()
-            self.threads.append(thread)
-            logger.info("Thread Flask_API démarré")
-        except Exception as e:
-            logger.error("Erreur au démarrage de l'API: %s", e)
-
-    # ──────────────────────────────────────────────────
-    # DÉMARRAGE GLOBAL ET ORCHESTRATION
-    # ──────────────────────────────────────────────────
-    
-    def start_all(self) -> None:
-        """Lance tous les services du portique."""
-        cfg: SystemConfig = self.cfg
-        logger.info("╔════════════════════════════════════════════╗")
-        logger.info("║    Démarrage GeV5 - %s", cfg.nom_portique)
-        logger.info("╚════════════════════════════════════════════╝")
-
-        # Démarrage du simulateur si mode simulation activé
-        if cfg.sim == 1:
-            if SimulationApp:
-                try:
-                    self.sim_app = SimulationApp()
-                    logger.info("Mode simulation activé")
-                except Exception as e:
-                    logger.error("Erreur au démarrage du simulateur: %s", e)
-            else:
-                logger.warning("Simulateur non disponible")
-
-        # Services toujours actifs
-        self.start_unipi()
-        self.start_cellules()
-        self.start_relais()
-        self.start_camera()
-        self.start_acquittement()
-        self.start_db_write()
-        self.start_bdf()
-        self.start_report()
-        self.start_email()
-        self.start_api()
-        self.start_disk()
-        self.start_usb()
-        self.start_watchdog()
-
-        # Services conditionnels - Modbus
-        if cfg.modbus == 1:
-            logger.info("Modbus activé")
-            self.start_modbus()
-        else:
-            fermer_ports([502, 5200])
-            logger.info("Modbus désactivé")
-
-        # Services conditionnels - eVx
-        if cfg.eVx == 1:
-            logger.info("eVx activé")
-            self.start_evx()
-            self.start_f2c()
-        else:
-            fermer_ports([9000, 6789])
-            logger.info("eVx désactivé")
-
-        # Services conditionnels - SMS
-        if cfg.mod_SMS == 1:
-            logger.info("SMS activé")
-            self.start_sms()
-
-        logger.info("╔════════════════════════════════════════════╗")
-        logger.info("║    Tous les threads sont lancés ✓         ║")
-        logger.info("╚════════════════════════════════════════════╝")
-
-        # Lance la boucle du simulateur si actif
-        if cfg.sim == 1 and self.sim_app:
-            try:
-                logger.info("Entrée en mode simulation (GUI)")
-                self.sim_app.mainloop()
-            except Exception as e:
-                logger.error("Erreur lors de mainloop simulateur: %s", e)
+        Il détecte les passages via les cellules et logge dans passages_v2.
+        """
+        self.passage_thread = PassageRecorderV2()
+        self.passage_thread.start()
+        self.threads.append(self.passage_thread)
+        logger.info("PassageRecorderV2 démarré.")
 
 
-def start_all(cfg: SystemConfig) -> None:
-    """Point d'entrée principal pour démarrer GeV5."""
-    system = Gev5System(cfg)
-    system.start_all()
+    # ------------------------------------------------------------------ #
+    # Démarrage global
+    # ------------------------------------------------------------------ #
+        def start_all(self) -> None:
+            logger.info("Démarrage GeV5 (cœur voies + stockage V2)")
+
+            # Cœur temps réel
+            self.start_comptage()
+            self.start_defauts()
+            self.start_alarmes()
+            self.start_courbes()
+
+            # Stockage V2 (fond + passages)
+            self.start_bdf_collector()
+            self.start_passage_recorder()
+
+            logger.info("Tous les threads GeV5 (voies + stockage V2) sont démarrés.")
+
